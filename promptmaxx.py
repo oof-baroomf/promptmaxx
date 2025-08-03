@@ -8,8 +8,6 @@
 # ]
 # ///
 
-
-
 from __future__ import annotations
 import asyncio
 import json
@@ -119,6 +117,38 @@ def est_tokens(txt: str) -> int:
     except Exception:
         return int(len(txt) * TOKEN_FACTOR)
 
+def _safe_tree() -> str:
+    """
+    Render a directory tree that respects .gitignore.
+    Falls back to the old behavior if the installed `tree`
+    lacks the --gitignore flag.
+    """
+    try:
+        proc = subprocess.run(
+            ["tree", "--gitignore", "-I", ".git"],
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        return proc.stdout
+    except subprocess.CalledProcessError:
+        # `tree` executed but returned error
+        return proc.stdout or ""
+    except FileNotFoundError:
+        return ""
+    except Exception:
+        # Unsupported flag or other failure – fall back
+        fallback = subprocess.run(
+            ["tree", "-I", ".git"],
+            text=True,
+            capture_output=True,
+        ).stdout
+        warning = (
+            "[WARNING] Your installed `tree` does not support --gitignore. "
+            "Upgrade to v2+ for accurate output.\n"
+        )
+        return warning + fallback
+
 # ──────────────────────── command registry ───────────────────────────── #
 
 COMMANDS: Dict[str, str] = {
@@ -145,17 +175,17 @@ class FilePane(Static):
 class PromptMaxx(App):
     CSS = """
     #files {
-      width: 1fr;              /* 1 part of the horizontal space */
-      border: solid $panel;    /* theme-aware color */
+      width: 1fr;
+      border: solid $panel;
       background: $surface;
       padding: 1;
     }
 
     #log {
-      width: 3fr;              /* 3 parts of the horizontal space */
+      width: 3fr;
       border: solid $panel;
       background: $surface;
-      padding: 1 2;            /* keep your asymmetric padding */
+      padding: 1 2;
     }
 
     #files, #log { height: 1fr; }
@@ -185,16 +215,11 @@ class PromptMaxx(App):
         self.query_one(RichLog).write(msg)
 
     def refresh_files(self) -> None:
-        # use a new list instance so Textual's reactive system detects the change
         pane = self.query_one(FilePane)
         pane.files = list(self.sel_files)
 
     def build_prompt(self) -> str:
-        tree = (
-            subprocess.run(["tree", "-I", ".git"], text=True, capture_output=True).stdout
-            if CFG["show_tree_before_files"]
-            else ""
-        )
+        tree = _safe_tree() if CFG["show_tree_before_files"] else ""
         parts = [CFG["prompt_prefix"], tree]
         for p in self.sel_files:
             parts.append(f"\n### {p} ###\n{p.read_text()}")
@@ -224,36 +249,21 @@ class PromptMaxx(App):
             self.write_log(txt)
 
     async def on_input_changed(self, ev: Input.Changed) -> None:
-        """Provide autocomplete suggestions as the user types."""
         text = ev.value
-        # show all commands while the user just typed '/'
-        if text == "/":
-            ev.input.autocomplete_suggestions = list(COMMANDS.keys())
-            return
-
-        # ──────────── remove files ────────────
-        elif text.startswith("/r "):
+        if text.startswith("/r "):
             rem = set(shlex.split(text[3:]))
             self.sel_files = [p for p in self.sel_files if str(p) not in rem]
             self.refresh_files()
-
-        # ──────────── add files ────────────
         elif text.startswith("/a "):
             args = shlex.split(text[3:])
-
-            # allow “.” to expand to every non-ignored file
             if "." in args:
                 args.remove(".")
                 args.extend(map(str, repo_files()))
-
-            # silently ignore anything that is not an existing path
             for f in args:
                 p = Path(f)
-                if p.exists() and p not in self.sel_files:
+                if p.is_file() and p not in self.sel_files:
                     self.sel_files.append(p)
-
             self.refresh_files()
-
         elif text.startswith("/"):
             ev.input.autocomplete_suggestions = [
                 cmd for cmd in COMMANDS if cmd.startswith(text)
@@ -275,27 +285,20 @@ class PromptMaxx(App):
                 if p.exists() and p not in self.sel_files:
                     self.sel_files.append(p)
             self.refresh_files()
-
         elif txt.startswith("/r "):
             rem = set(shlex.split(txt[3:]))
             self.sel_files = [p for p in self.sel_files if str(p) not in rem]
             self.refresh_files()
-
         elif txt == "/t":
             self.write_log(f"Tokens ≈ {est_tokens(self.build_prompt())}")
-
         elif txt == "/c":
             self.prompt_cache = self.build_prompt()
             pyperclip.copy(self.prompt_cache)
             self.write_log("[cyan]Prompt copied[/cyan]")
-
         elif txt == "/p":
             await self.handle_paste()
-
-        # help variants: '/', '/h', '/help'
         elif txt in {"/", "/h", "/help"}:
             self.show_help()
-
         else:
             self.write_log(f"[red]Unknown command {txt}[/red]")
 
@@ -308,34 +311,22 @@ class PromptMaxx(App):
     async def handle_paste(self) -> None:
         paste = pyperclip.paste()
         self.write_log("[magenta]Pasted output:[/magenta]\n" + paste)
-
-        # first: use picker model to determine which files are referenced
         try:
             files = await self.call_picker(paste)
         except Exception as exc:
             self.show_exc(exc)
             return
-
-        # second: run the editing model with full contents
         await self.call_editor(paste, files)
 
     async def call_picker(self, paste: str) -> List[str]:
-        tree = subprocess.run(
-            ["tree", "-I", ".git"], text=True, capture_output=True
-        ).stdout
+        tree = _safe_tree()
         resp = await asyncio.to_thread(
             litellm.completion,
             model=CFG["model_id"],
             api_key=API_KEY,
             messages=[
                 {"role": "system", "content": CFG["picker_prompt"]},
-                {
-                    "role": "user",
-                    "content": "DIRECTORY TREE:\n"
-                    + tree
-                    + "\n\nUSER INSTRUCTIONS:\n"
-                    + paste,
-                },
+                {"role": "user", "content": "DIRECTORY TREE:\n" + tree + "\n\nUSER INSTRUCTIONS:\n" + paste},
             ],
         )
         raw = resp["choices"][0]["message"]["content"]
@@ -344,9 +335,7 @@ class PromptMaxx(App):
             self.write_log(f"[green]Picker chose:[/green] {picked}")
             return picked
         except Exception:
-            raise ValueError(
-                f"Picker did not return valid JSON array – got:\n{raw}"
-            )
+            raise ValueError("Picker did not return valid JSON array – got:\n" + raw)
 
     async def call_editor(self, paste: str, files: List[str]) -> None:
         def read_text(f: str) -> str:
@@ -354,16 +343,10 @@ class PromptMaxx(App):
                 return Path(f).read_text()
             except Exception:
                 return ""
-
-        payload = "\n\n".join(
-            f"### {f}\n{read_text(f)}" for f in files if Path(f).exists()
-        )
+        payload = "\n\n".join(f"### {f}\n{read_text(f)}" for f in files if Path(f).exists())
         self.write_log(str([
             {"role": "system", "content": CFG["editing_prompt"]},
-            {
-                "role": "user",
-                "content": paste + "\n\n--- FILES ---\n" + payload,
-            },
+            {"role": "user", "content": paste + "\n\n--- FILES ---\n" + payload},
         ]))
         resp = await asyncio.to_thread(
             litellm.completion,
@@ -371,10 +354,7 @@ class PromptMaxx(App):
             api_key=API_KEY,
             messages=[
                 {"role": "system", "content": CFG["editing_prompt"]},
-                {
-                    "role": "user",
-                    "content": paste + "\n\n--- FILES ---\n" + payload,
-                },
+                {"role": "user", "content": paste + "\n\n--- FILES ---\n" + payload},
             ],
         )
         out = resp["choices"][0]["message"]["content"]
